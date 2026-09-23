@@ -1,0 +1,19 @@
+[project]
+name = "ai-bk"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi[standard]>=0.141.1",
+    "langchain-community>=0.4.2",
+    "langchain-core>=1.6.4",
+    "langchain-openai>=1.6.5",
+    "langchain-text-splitters>=1.1.2",
+    "opensearch-py>=3.2.0",
+    "rank-bm25>=0.2.2",
+    "sqlmodel>=0.0.42",
+    "uvicorn[standard]>=0.52.4",
+]
+[tool.fastapi]
+entrypoint = "app.main:app"
