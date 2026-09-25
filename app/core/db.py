@@ -2,7 +2,8 @@ from fastapi import Depends
 from sqlalchemy.util.typing import Annotated
 from app.core.settings import settings
 from opensearchpy import OpenSearch
-# from sqlalchemy import create_engine
+from sqlmodel import Field, Session, SQLModel, create_engine
+
 
 # Create the client with SSL/TLS enabled, but hostname verification disabled.
 open_search_client = OpenSearch(
@@ -14,6 +15,17 @@ open_search_client = OpenSearch(
     ssl_show_warn = False
 )
 
+# Create the Primary (Write) Database Engine
+write_engine = create_engine(
+    settings.sqlalchemy_database_uri,
+    echo=False, # Set to False in production
+    pool_pre_ping=True
+)
+
+def get_pgvector_session():
+    with Session(write_engine) as session:
+        yield session
+        
 def get_open_search_session():
     """ Returing opensearch client object"""
     return open_search_client
