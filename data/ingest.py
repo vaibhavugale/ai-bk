@@ -1,16 +1,19 @@
 """
-OpenSearch Ingestion Script for Workflow Documents
-Indexes workflow documents with embeddings into OpenSearch
+PostgreSQL (pgvector) Ingestion Script for Workflow Documents
+Indexes workflow documents with embeddings into PostgreSQL using pgvector
 """
 
 import json
 import os
 import sys
 import time
-import requests
 from typing import List, Dict, Any
 from dotenv import load_dotenv
-from opensearchpy import OpenSearch, helpers
+from sqlalchemy import text
+from sqlmodel import Session, SQLModel, create_engine, Field, select
+from sqlalchemy import Column, String, JSON
+from pgvector.sqlalchemy import Vector
+from datetime import datetime
 
 # Add the root directory to sys.path to import from app
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,63 +21,26 @@ from app.core.settings import settings
 
 load_dotenv()
 
-# Configuration
-OPENSEARCH_INDEX = os.getenv("OPENSEARCH_INDEX", "workflow_documents")
-LITNG_EMBEDDING_API = "https://8001-01krc32prg8r3e6sd3v76vscg9.cloudspaces.litng.ai/v1"
-
 BATCH_SIZE = 20
 RATE_LIMIT_DELAY = 0.5  # seconds between batches
 
-
-def get_opensearch_client() -> OpenSearch:
-    """Create and return OpenSearch client"""
-    client = OpenSearch(
-        hosts=[{'host': settings.OPENSEARCH_HOST, 'port': settings.OPENSEARCH_PORT}],
-        http_compress=True, # enables gzip compression for request bodies
-        use_ssl=True,
-        verify_certs=False,
-        ssl_assert_hostname=False,
-        ssl_show_warn=False
-    )
-    return client
+from app.model.workflow import WorkflowDocument
 
 
-def get_or_create_index(client: OpenSearch, index_name: str):
-    """Create OpenSearch index if it doesn't exist"""
-    print(f"Ensuring index exists: {index_name}")
-    if not client.indices.exists(index=index_name):
-        index_body = {
-            "settings": {
-                "index": {
-                    "knn": True,
-                    "knn.algo_param.ef_search": 100
-                }
-            },
-            "mappings": {
-                "properties": {
-                    "embedding": {
-                        "type": "knn_vector",
-                        "dimension": 384, # BAAI/bge-small-en-v1.5 produces 384d vectors
-                        "method": {
-                            "name": "hnsw",
-                            "space_type": "cosinesimil",
-                            "engine": "lucene"
-                        }
-                    },
-                    "document": {"type": "text"},
-                    "type": {"type": "keyword"},
-                    "title": {"type": "text"},
-                    "category": {"type": "keyword"},
-                    "estimated_duration": {"type": "text"},
-                    "required_permissions": {"type": "keyword"},
-                    "tags": {"type": "keyword"},
-                    "created_date": {"type": "date"},
-                    "last_updated": {"type": "date"}
-                }
-            }
-        }
-        client.indices.create(index=index_name, body=index_body)
-    return index_name
+def get_engine():
+    """Create and return SQLAlchemy engine"""
+    engine = create_engine(settings.sqlalchemy_database_uri)
+    return engine
+
+
+def setup_database(engine):
+    """Ensure pgvector extension exists and create tables"""
+    print("Setting up database and ensuring pgvector is installed...")
+    with Session(engine) as session:
+        session.exec(text("CREATE EXTENSION IF NOT EXISTS vector;"))
+        session.commit()
+    
+    SQLModel.metadata.create_all(engine)
 
 
 def format_workflow_text(workflow: Dict[str, Any]) -> str:
@@ -102,15 +68,12 @@ def format_workflow_text(workflow: Dict[str, Any]) -> str:
 
 
 def get_embeddings(texts: List[str]) -> List[List[float]]:
-    """Generate embeddings for a batch of texts using Litng API via LangChain"""
+    """Generate embeddings for a batch of texts using a local Hugging Face model via LangChain"""
     try:
-        from langchain_openai import OpenAIEmbeddings
-        from pydantic import SecretStr
-        embeddings = OpenAIEmbeddings(
-            model="BAAI/bge-small-en-v1.5",
-            api_key=SecretStr("my-super-secret-token"),
-            base_url=LITNG_EMBEDDING_API,
-            check_embedding_ctx_length=False,
+        from langchain_huggingface import HuggingFaceEmbeddings
+        embeddings = HuggingFaceEmbeddings(
+            model_name="BAAI/bge-small-en-v1.5",
+            # Optionally configure model_kwargs or encode_kwargs here
         )
         return embeddings.embed_documents(texts)
     except Exception as e:
@@ -118,34 +81,27 @@ def get_embeddings(texts: List[str]) -> List[List[float]]:
         raise
 
 
-def prepare_document(workflow: Dict[str, Any], embedding: List[float], index_name: str) -> Dict[str, Any]:
-    """Prepare document for OpenSearch bulk ingestion"""
-    return {
-        "_index": index_name,
-        "_id": workflow["id"],
-        "_source": {
-            "document": format_workflow_text(workflow),
-            "embedding": embedding,
-            "type": workflow.get("type"),
-            "title": workflow.get("title"),
-            "category": workflow.get("category"),
-            "estimated_duration": workflow.get("estimated_duration"),
-            "required_permissions": workflow.get("required_permissions", []),
-            "tags": workflow.get("tags", []),
-            "created_date": workflow.get("created_date"),
-            "last_updated": workflow.get("last_updated")
-        }
-    }
+def prepare_document(workflow: Dict[str, Any], embedding: List[float]) -> WorkflowDocument:
+    """Prepare SQLModel document for database insertion"""
+    return WorkflowDocument(
+        id=workflow["id"],
+        document=format_workflow_text(workflow),
+        embedding=embedding,
+        type=workflow.get("type"),
+        title=workflow.get("title"),
+        category=workflow.get("category"),
+        estimated_duration=workflow.get("estimated_duration"),
+        required_permissions=workflow.get("required_permissions", []),
+        tags=workflow.get("tags", []),
+        created_date=workflow.get("created_date"),
+        last_updated=workflow.get("last_updated")
+    )
 
 
-def ingest_workflows(
-    client: OpenSearch,
-    index_name: str,
-    workflows: List[Dict[str, Any]]
-):
-    """Ingest workflows into OpenSearch with embeddings"""
+def ingest_workflows(engine, workflows: List[Dict[str, Any]]):
+    """Ingest workflows into PostgreSQL with embeddings"""
     total = len(workflows)
-    print(f"\nIngesting {total} workflows into OpenSearch...")
+    print(f"\nIngesting {total} workflows into PostgreSQL database...")
     
     # Process in batches
     for i in range(0, total, BATCH_SIZE):
@@ -169,18 +125,23 @@ def ingest_workflows(
             print(f"Failed to get embeddings for batch {batch_num}: Got {len(embeddings)} but expected {len(batch)}")
             continue
             
-        # Prepare documents for bulk index
-        actions = [
-            prepare_document(wf, emb, index_name)
-            for wf, emb in zip(batch, embeddings)
-        ]
-        
-        # Insert into OpenSearch
+        # Insert into Database
         try:
-            success, failed = helpers.bulk(client, actions)
-            print(f"  ✓ Batch {batch_num} indexed successfully ({success} items)")
-            if failed:
-                print(f"  ⚠ Batch {batch_num} had {len(failed)} failed items")
+            with Session(engine) as session:
+                for wf, emb in zip(batch, embeddings):
+                    # Check if document already exists to avoid duplication
+                    existing = session.exec(select(WorkflowDocument).where(WorkflowDocument.id == wf["id"])).first()
+                    if existing:
+                        # Update existing
+                        doc = prepare_document(wf, emb)
+                        for key, value in doc.model_dump().items():
+                            setattr(existing, key, value)
+                    else:
+                        # Add new
+                        doc = prepare_document(wf, emb)
+                        session.add(doc)
+                session.commit()
+            print(f"  ✓ Batch {batch_num} indexed successfully")
         except Exception as e:
             print(f"  ✗ Failed to index batch {batch_num}: {e}")
         
@@ -188,20 +149,18 @@ def ingest_workflows(
         if i + BATCH_SIZE < total:
             time.sleep(RATE_LIMIT_DELAY)
     
-    # Get document count
-    client.indices.refresh(index=index_name)
-    count = client.count(index=index_name)['count']
-    print(f"\n✓ Ingestion complete! {count} documents in index")
+    with Session(engine) as session:
+        count = session.exec(select(WorkflowDocument)).all()
+        print(f"\n✓ Ingestion complete! {len(count)} documents in table")
 
 
 def main():
     """Main ingestion workflow"""
     print("=" * 60)
-    print("Workflow Document Ingestion (OpenSearch)")
+    print("Workflow Document Ingestion (PostgreSQL pgvector)")
     print("=" * 60)
     
     # Load workflow data
-    data_file = "../data/workflow_dataset.json"
     data_file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "workflow_dataset.json")
     if not os.path.exists(data_file_path):
         print(f"Error: Data file not found: {data_file_path}")
@@ -213,23 +172,19 @@ def main():
         workflows = json.load(f)
     print(f"Loaded {len(workflows)} workflows")
     
-    # Initialize OpenSearch client
-    print("\nConnecting to OpenSearch...")
-    client = get_opensearch_client()
-    
-    # Test connection
+    print("\nConnecting to PostgreSQL database...")
     try:
-        info = client.info()
-        print(f"Connected to OpenSearch cluster: {info['cluster_name']}")
+        engine = get_engine()
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        print("Connected to PostgreSQL successfully")
     except Exception as e:
-        print(f"Error connecting to OpenSearch: {e}")
+        print(f"Error connecting to PostgreSQL database: {e}")
         return
     
-    # Create index
-    get_or_create_index(client, OPENSEARCH_INDEX)
-    
-    # Ingest workflows
-    ingest_workflows(client, OPENSEARCH_INDEX, workflows)
+    setup_database(engine)
+    ingest_workflows(engine, workflows)
     
     print("\n" + "=" * 60)
     print("Ingestion complete!")
